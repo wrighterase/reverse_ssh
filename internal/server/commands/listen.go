@@ -14,6 +14,7 @@ import (
 	"github.com/NHAS/reverse_ssh/internal/terminal"
 	"github.com/NHAS/reverse_ssh/internal/terminal/autocomplete"
 	"github.com/NHAS/reverse_ssh/pkg/logger"
+	"github.com/NHAS/reverse_ssh/pkg/table"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -29,6 +30,30 @@ type listen struct {
 }
 
 func (l *listen) server(tty io.ReadWriter, line terminal.ParsedLine, onAddrs, offAddrs []string) error {
+	// Handle remove by ID
+	if line.IsSet("r") {
+		idStr, err := line.GetArgString("id")
+		if err != nil {
+			return errors.New("remove requires --id, e.g --r --id 1 --server")
+		}
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			return fmt.Errorf("invalid id: %s", idStr)
+		}
+
+		listeners := multiplexer.ServerMultiplexer.GetListeners()
+		if id < 1 || id > len(listeners) {
+			return fmt.Errorf("server id %d out of range (1-%d)", id, len(listeners))
+		}
+		addr := listeners[id-1]
+		err = multiplexer.ServerMultiplexer.StopListener(addr)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(tty, "stopped listening on: ", addr)
+		return nil
+	}
+
 	if line.IsSet("l") {
 		listeners := multiplexer.ServerMultiplexer.GetListeners()
 
@@ -37,9 +62,12 @@ func (l *listen) server(tty io.ReadWriter, line terminal.ParsedLine, onAddrs, of
 			return nil
 		}
 
-		for _, listener := range listeners {
-			fmt.Fprintf(tty, "%s\n", listener)
+		t, _ := table.NewTable("Server Listeners", "ID", "Listeners")
+		for i, listener := range listeners {
+			id := fmt.Sprintf("%d", i+1)
+			t.AddValues(id, listener)
 		}
+		t.Fprint(tty)
 		return nil
 	}
 
@@ -89,8 +117,85 @@ func (l *listen) client(user *users.User, tty io.ReadWriter, line terminal.Parse
 		return fmt.Errorf("No clients matched %q", specifier)
 	}
 
+	// Handle remove by ID
+	if line.IsSet("r") {
+		idStr, err := line.GetArgString("id")
+		if err != nil {
+			return errors.New("remove requires --id, e.g --r --id 1 --client")
+		}
+		id, err := strconv.Atoi(idStr)
+		if err != nil {
+			return fmt.Errorf("invalid id: %s", idStr)
+		}
+
+		type entry struct {
+			clientID    string
+			portMapping string
+		}
+
+		var entries []entry
+		for clientID, cc := range foundClients {
+			result, message, _ := cc.SendRequest("query-tcpip-forwards", true, nil)
+			if !result {
+				fmt.Fprintf(tty, "%s does not support querying server forwards\n", clientID)
+				continue
+			}
+
+			f := struct {
+				RemoteForwards []string
+			}{}
+			err := ssh.Unmarshal(message, &f)
+			if err != nil {
+				fmt.Fprintf(tty, "%s sent an incompatible message: %s\n", clientID, err)
+				continue
+			}
+
+			for _, rf := range f.RemoteForwards {
+				entries = append(entries, entry{clientID, rf})
+			}
+		}
+
+		if id < 1 || id > len(entries) {
+			return fmt.Errorf("client id %d out of range (1-%d)", id, len(entries))
+		}
+
+		target := entries[id-1]
+		ip, port, err := net.SplitHostPort(target.portMapping)
+		if err != nil {
+			return err
+		}
+		p, err := strconv.ParseInt(port, 10, 32)
+		if err != nil {
+			return err
+		}
+
+		b := ssh.Marshal(&internal.RemoteForwardRequest{
+			BindAddr: ip,
+			BindPort: uint32(p),
+		})
+
+		applied := 0
+		for c, sc := range foundClients {
+			result, message, err := sc.SendRequest("cancel-tcpip-forward", true, b)
+			if !result {
+				fmt.Fprintln(tty, "failed to stop port on: ", c, ": ", string(message))
+				continue
+			}
+			if err != nil {
+				fmt.Fprintln(tty, "error stopping port on: ", c, ": ", err)
+				continue
+			}
+			applied++
+		}
+
+		fmt.Fprintf(tty, "stopped %s on %d clients\n", target.portMapping, applied)
+		return nil
+	}
+
 	if line.IsSet("l") {
 
+		t, _ := table.NewTable("Client Listeners", "ID", "Listeners")
+		idx := 0
 		for id, cc := range foundClients {
 			result, message, _ := cc.SendRequest("query-tcpip-forwards", true, nil)
 			if !result {
@@ -104,17 +209,22 @@ func (l *listen) client(user *users.User, tty io.ReadWriter, line terminal.Parse
 
 			err := ssh.Unmarshal(message, &f)
 			if err != nil {
-				fmt.Fprintf(tty, "%s sent an incompatiable message: %s\n", id, err)
+				idx++
+				if err := t.AddValues(fmt.Sprintf("%d", idx), id); err != nil {
+					return err
+				}
 				continue
 			}
 
-			fmt.Fprintf(tty, "%s (%s %s): \n", id, users.NormaliseHostname(cc.User()), cc.RemoteAddr().String())
 			for _, rf := range f.RemoteForwards {
-				fmt.Fprintf(tty, "\t%s\n", rf)
+				idx++
+				if err := t.AddValues(fmt.Sprintf("%d", idx), net.JoinHostPort(id, rf)); err != nil {
+					return err
+				}
 			}
-
 		}
 
+		t.Fprint(tty)
 		return nil
 	}
 
@@ -244,6 +354,17 @@ func (l *listen) client(user *users.User, tty io.ReadWriter, line terminal.Parse
 	return nil
 }
 
+func splitAtFirst(s, sep string) []string {
+	idx := 0
+	for i := 0; i < len(s); i++ {
+		if i+len(sep) <= len(s) && s[i:i+len(sep)] == sep {
+			idx = i
+			break
+		}
+	}
+	return []string{s[:idx], s[idx+len(sep):]}
+}
+
 func (w *listen) ValidArgs() map[string]string {
 
 	r := map[string]string{
@@ -251,6 +372,8 @@ func (w *listen) ValidArgs() map[string]string {
 		"auto": "Automatically turn on server control port on clients that match criteria, (use --off --auto to disable and --l --auto to view)",
 		"off":  "Turn off port, e.g --off :8080 127.0.0.1:4444",
 		"l":    "List all enabled addresses",
+		"r":    "Remove listener by index id. Requires '--id'",
+		"id":   "Listener ID. Requires '-r'",
 	}
 
 	addDuplicateFlags("Open server port on client/s takes a pattern, e.g -c *, --client your.hostname.here", r, "client", "c")
@@ -279,8 +402,8 @@ func (w *listen) Run(user *users.User, tty io.ReadWriter, line terminal.ParsedLi
 		return errors.New("no value specified for --off, requires port e.g --off :4343")
 	}
 
-	if onAddrs == nil && offAddrs == nil && !line.IsSet("l") {
-		return errors.New("no actionable argument supplied, please add --on, --off or -l (list)")
+	if onAddrs == nil && offAddrs == nil && !line.IsSet("l") && !line.IsSet("r") {
+		return errors.New("no actionable argument supplied, please add --on, --off, -l (list) or -r (remove)")
 	}
 
 	if line.IsSet("server") || line.IsSet("s") {
